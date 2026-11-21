@@ -36,6 +36,32 @@ def get_conn():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
+def init_db():
+    if not DATABASE_URL:
+        return
+    try:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS password_reset_codes (
+                        id SERIAL PRIMARY KEY,
+                        email TEXT NOT NULL,
+                        code_hash TEXT NOT NULL,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        used BOOLEAN NOT NULL DEFAULT false,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                    """
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"[INIT_DB WARNING] {exc}")
+
+
+init_db()
+
+
 class SendCodeRequest(BaseModel):
     email: EmailStr
 
@@ -45,6 +71,12 @@ class VerifySignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)
     code: str = Field(min_length=6, max_length=6)
+
+
+class ForgotPasswordResetRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6)
+    new_password: str = Field(min_length=6)
 
 
 class LoginRequest(BaseModel):
@@ -81,7 +113,7 @@ def hash_val(val: str) -> str:
     return hashlib.sha256(val.encode()).hexdigest()
 
 
-def send_via_resend(to_email: str, code: str, from_email: str) -> bool:
+def send_via_resend(to_email: str, code: str, from_email: str, subject: str = "TRONVEX 6-Digit Verification Code") -> bool:
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     if not api_key:
         return False
@@ -89,7 +121,7 @@ def send_via_resend(to_email: str, code: str, from_email: str) -> bool:
     payload = {
         "from": from_email,
         "to": [to_email],
-        "subject": "TRONVEX 6-Digit Verification Code",
+        "subject": subject,
         "text": f"Your verification code is: {code}\nValid for 10 minutes.",
     }
     req = urllib.request.Request(
@@ -114,7 +146,7 @@ def send_via_resend(to_email: str, code: str, from_email: str) -> bool:
         return False
 
 
-def send_otp_email(to_email: str, code: str) -> str:
+def send_otp_email(to_email: str, code: str, subject: str = "TRONVEX 6-Digit Verification Code") -> str:
     smtp_host = os.getenv("SMTP_HOST", "").strip()
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
@@ -122,7 +154,7 @@ def send_otp_email(to_email: str, code: str) -> str:
     from_email = os.getenv("FROM_EMAIL", "").strip() or smtp_user or "onboarding@resend.dev"
 
     if os.getenv("RESEND_API_KEY", "").strip():
-        if send_via_resend(to_email, code, from_email):
+        if send_via_resend(to_email, code, from_email, subject=subject):
             return "resend"
         print(f"[OTP FALLBACK] {to_email}: {code}")
         return "log_fallback"
@@ -130,7 +162,7 @@ def send_otp_email(to_email: str, code: str) -> str:
     if smtp_host and smtp_user and smtp_pass:
         try:
             msg = EmailMessage()
-            msg["Subject"] = "TRONVEX 6-Digit Verification Code"
+            msg["Subject"] = subject
             msg["From"] = from_email
             msg["To"] = to_email
             msg.set_content(f"Your verification code is: {code}\nValid for 10 minutes.")
@@ -258,6 +290,85 @@ def verify_signup(payload: VerifySignupRequest):
         "email": user["email"],
         "ref_code": user["ref_code"],
     }
+
+
+@app.post("/api/auth/forgot-password/send-code")
+def forgot_password_send_code(payload: SendCodeRequest):
+    email = payload.email.lower().strip()
+    code = f"{secrets.randbelow(900000) + 100000}"
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="No account found with this email.")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS password_reset_codes (
+                    id SERIAL PRIMARY KEY,
+                    email TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used BOOLEAN NOT NULL DEFAULT false,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cur.execute("UPDATE password_reset_codes SET used = true WHERE email = %s AND used = false", (email,))
+            cur.execute(
+                """
+                INSERT INTO password_reset_codes (email, code_hash, expires_at, used)
+                VALUES (%s, %s, %s, false)
+                """,
+                (email, hash_val(code), expires_at),
+            )
+        conn.commit()
+
+    delivery = send_otp_email(email, code, subject="TRONVEX Password Reset Code")
+    return {"message": "Password reset code sent.", "delivery": delivery}
+
+
+@app.post("/api/auth/forgot-password/reset")
+def forgot_password_reset(payload: ForgotPasswordResetRequest):
+    email = payload.email.lower().strip()
+    code_hash = hash_val(payload.code.strip())
+    now = datetime.now(timezone.utc)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT * FROM password_reset_codes
+                WHERE email = %s AND used = false
+                ORDER BY id DESC LIMIT 1
+                """,
+                (email,),
+            )
+            otp_row = cur.fetchone()
+
+            if not otp_row:
+                raise HTTPException(status_code=400, detail="Request a password reset code first.")
+            if now > otp_row["expires_at"]:
+                raise HTTPException(status_code=400, detail="Reset code expired.")
+            if otp_row["code_hash"] != code_hash:
+                raise HTTPException(status_code=400, detail="Invalid reset code.")
+
+            cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+            user = cur.fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail="No account found with this email.")
+
+            new_pw_hash = hash_val(payload.new_password + PASSWORD_SALT)
+            cur.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (new_pw_hash, user["id"]),
+            )
+            cur.execute("UPDATE password_reset_codes SET used = true WHERE id = %s", (otp_row["id"],))
+        conn.commit()
+
+    return {"message": "Password updated successfully. You can now log in."}
 
 
 @app.post("/api/auth/login")
