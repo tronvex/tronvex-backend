@@ -78,25 +78,33 @@ def hash_val(val: str) -> str:
     return hashlib.sha256(val.encode()).hexdigest()
 
 
-def send_otp_email(to_email: str, code: str) -> None:
-    smtp_host = os.getenv("SMTP_HOST")
+def send_otp_email(to_email: str, code: str) -> str:
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USER")
-    smtp_pass = os.getenv("SMTP_PASS")
-    from_email = os.getenv("FROM_EMAIL", smtp_user or "no-reply@tronvex.online")
+    smtp_user = os.getenv("SMTP_USER", "").strip()
+    smtp_pass = os.getenv("SMTP_PASS", "").strip()
+    from_email = os.getenv("FROM_EMAIL", smtp_user or "no-reply@tronvex.online").strip()
 
     if smtp_host and smtp_user and smtp_pass:
-        msg = EmailMessage()
-        msg["Subject"] = "TRONVEX 6-Digit Verification Code"
-        msg["From"] = from_email
-        msg["To"] = to_email
-        msg.set_content(f"Your verification code is: {code}\nValid for 10 minutes.")
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_pass)
-            server.send_message(msg)
-    else:
-        print(f"[OTP DEV] {to_email}: {code}")
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = "TRONVEX 6-Digit Verification Code"
+            msg["From"] = from_email
+            msg["To"] = to_email
+            msg.set_content(f"Your verification code is: {code}\nValid for 10 minutes.")
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            return "smtp"
+        except Exception as exc:
+            print(f"[SMTP ERROR] {to_email}: {exc} | [OTP FALLBACK] {to_email}: {code}")
+            return "log_fallback"
+
+    print(f"[OTP DEV] {to_email}: {code}")
+    return "dev_log"
 
 
 def get_auth_user(authorization: str | None) -> dict:
@@ -105,7 +113,7 @@ def get_auth_user(authorization: str | None) -> dict:
     token = authorization.replace("Bearer ", "", 1).strip()
     session = TOKENS_TO_USER.get(token)
     if not session:
-        raise HTTPException(status_code=401, detail="Invalid session.")
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please log in again.")
 
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -138,8 +146,8 @@ def send_code(payload: SendCodeRequest):
             )
         conn.commit()
 
-    send_otp_email(email, code)
-    return {"message": "Verification code sent."}
+    delivery = send_otp_email(email, code)
+    return {"message": "Verification code sent.", "delivery": delivery}
 
 
 @app.post("/api/auth/verify-signup")
@@ -330,8 +338,16 @@ def deposit_webhook(payload: DepositWebhookPayload, x_webhook_secret: str | None
                     (payload.tx_hash, dep["id"]),
                 )
                 cur.execute(
-                    "UPDATE transactions SET status = 'rejected', tx_hash = %s WHERE user_id = %s AND tx_type = 'deposit' AND amount = %s AND status = 'pending'",
-                    (payload.tx_hash, dep["user_id"], dep["amount"]),
+                    """
+                    UPDATE transactions
+                    SET status = 'rejected', tx_hash = %s
+                    WHERE id = (
+                        SELECT id FROM transactions
+                        WHERE user_id = %s AND tx_type = 'deposit' AND status = 'pending'
+                        ORDER BY id DESC LIMIT 1
+                    )
+                    """,
+                    (payload.tx_hash, dep["user_id"]),
                 )
                 conn.commit()
                 return {"message": "Deposit rejected.", "status": "rejected"}
@@ -358,7 +374,11 @@ def deposit_webhook(payload: DepositWebhookPayload, x_webhook_secret: str | None
                 """
                 UPDATE transactions
                 SET status = 'completed', amount = %s, tx_hash = %s
-                WHERE user_id = %s AND tx_type = 'deposit' AND status = 'pending'
+                WHERE id = (
+                    SELECT id FROM transactions
+                    WHERE user_id = %s AND tx_type = 'deposit' AND status = 'pending'
+                    ORDER BY id DESC LIMIT 1
+                )
                 """,
                 (payload.amount, payload.tx_hash, dep["user_id"]),
             )
