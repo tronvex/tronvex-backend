@@ -2,6 +2,9 @@ import os
 import secrets
 import hashlib
 import smtplib
+import urllib.request
+import urllib.error
+import json
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, HTTPException, Header
@@ -78,12 +81,51 @@ def hash_val(val: str) -> str:
     return hashlib.sha256(val.encode()).hexdigest()
 
 
+def send_via_resend(to_email: str, code: str, from_email: str) -> bool:
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
+        return False
+
+    payload = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": "TRONVEX 6-Digit Verification Code",
+        "text": f"Your verification code is: {code}\nValid for 10 minutes.",
+    }
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "TRONVEX-API/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="ignore")
+        print(f"[RESEND HTTP ERROR] {to_email}: {exc.code} {err_body}")
+        return False
+    except Exception as exc:
+        print(f"[RESEND ERROR] {to_email}: {exc}")
+        return False
+
+
 def send_otp_email(to_email: str, code: str) -> str:
     smtp_host = os.getenv("SMTP_HOST", "").strip()
     smtp_port = int(os.getenv("SMTP_PORT", "587"))
     smtp_user = os.getenv("SMTP_USER", "").strip()
     smtp_pass = os.getenv("SMTP_PASS", "").strip()
-    from_email = os.getenv("FROM_EMAIL", smtp_user or "no-reply@tronvex.online").strip()
+    from_email = os.getenv("FROM_EMAIL", "").strip() or smtp_user or "onboarding@resend.dev"
+
+    if os.getenv("RESEND_API_KEY", "").strip():
+        if send_via_resend(to_email, code, from_email):
+            return "resend"
+        print(f"[OTP FALLBACK] {to_email}: {code}")
+        return "log_fallback"
 
     if smtp_host and smtp_user and smtp_pass:
         try:
